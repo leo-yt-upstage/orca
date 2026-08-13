@@ -40,24 +40,88 @@ export const COLD_RESTORE_SEED_MODE_RESET = RESET_MOUSE_REPORTING
 // drains queued foreground chunks under the stale pen).
 export const RESET_GRAPHIC_RENDITION = '\x1b[0m'
 
+// CAN. Grounds the parser AND marks an in-flight OSC/DCS/APC aborted: xterm
+// dispatches those with `success = code !== 0x18 && code !== 0x1a`, so a bare
+// ESC grounds the parser but COMMITS what the gap truncated — a half-read OSC 0
+// retitles the pane, OSC 52 writes the clipboard. Leads the first replay write
+// only; later writes follow well-formed payloads with nothing left to abort.
+export const ABORT_TRUNCATED_CONTROL_STRING = '\x18'
+
 /**
- * State to re-establish when renderer-bound bytes were dropped and the gap
- * cannot be replayed away.
+ * Grounding for a LIVE byte stream after dropped bytes — the drop marker and
+ * the abandon paths, which drain queued chunks instead of repainting.
  *
- * Scoped to the pen on purpose. A gap can in principle strand other carried
- * state — an ISO 2022 charset designation, an open OSC 8 hyperlink, a partial
- * escape — and earlier revisions of this reset covered those too. They are
- * dropped here because each one changes what a live TUI sees on a path that
- * runs in production, none of them has a reported symptom behind it, and the
- * pen is what the field reports actually show (STA-4042). Widen this only with
- * a symptom to point at.
- *
- * Deliberately NOT a soft reset (DECSTR) either: xterm's DECSTR wipes kitty
- * flags and stacks (see terminal-kitty-keyboard-mode-tracker applySoftReset),
- * which would silence Option chords for a live agent that negotiates them only
- * at startup.
+ * Parser + pen only: a live TUI keeps writing here and owns its charset and
+ * margins, so forcing those back would break an app that declares them once.
+ * Not DECSTR either — xterm's soft reset wipes the kitty flags and stacks
+ * agents negotiate only at startup.
  */
-export const RESET_AFTER_BYTE_GAP = RESET_GRAPHIC_RENDITION
+export const RESET_AFTER_BYTE_GAP = `${ABORT_TRUNCATED_CONTROL_STRING}${RESET_GRAPHIC_RENDITION}`
+
+/**
+ * Terminal-scoped baseline a serialized snapshot assumes it lands on.
+ *
+ * SerializeAddon diffs cells against the DEFAULT attributes and emits no
+ * charset at all, so the payload is only correct at default pen, GL=G0,
+ * G0=ASCII, origin off, autowrap on, insert off, reverse-wrap off. A replay
+ * runs precisely because bytes were dropped, so none of that can be assumed.
+ * G1-G3 are designated even though the payload never leaves G0, because
+ * restoreCursor() reloads all four and the next SO would paint line-drawing.
+ * `?45l` and `4l` are here for the same reason `?7h` is: the model re-emits
+ * those only when SET, so a stranded ON survives the repaint.
+ *
+ * No DECSCNM (`?5l`) only because xterm.js does not implement it (its
+ * `FIXME: implement DECSCNM`, InputHandler.ts:1925 — no `case 5` in either
+ * DEC-private switch). Sink-specific: a real terminal would need it back.
+ */
+export const REPLAY_BASELINE_TERMINAL_RESET = `${RESET_GRAPHIC_RENDITION}\x0f\x1b(B\x1b)B\x1b*B\x1b+B\x1b[?6l\x1b[?7h\x1b[?45l\x1b[4l`
+
+// Buffer-scoped, so it is emitted on each side of a switch: margins live on the
+// xterm buffer and `?1049` neither carries them across nor clears them unless it
+// actually swaps buffers.
+export const REPLAY_BASELINE_BUFFER_RESET = '\x1b[r'
+
+// DECSC last, so the saved-cursor register holds grounded state: otherwise a
+// stranded `ESC 7` is reachable through the live TUI's next `ESC 8`. A snapshot
+// carrying the model's own DECSC epilogue overwrites this, so it is only a floor.
+const SAVE_GROUNDED_CURSOR = '\x1b7'
+
+/**
+ * Prologue that puts a pane on `targetAlternateScreen` and grounds it to the
+ * baseline a serialized snapshot is diffed against. Lives here, not in the
+ * renderer, because the parity/fuzz harnesses assert against it too and
+ * re-spelling the literals is what drifted them apart before (#12101).
+ *
+ * The switch is CONDITIONAL: `?1049` is not a no-op when the pane is already on
+ * the target — xterm skips only the buffer swap and still runs restoreCursor()
+ * and the kitty flag swap (InputHandler `case 1049`). Emitting it regardless
+ * would park the flags of an agent that negotiated kitty on the normal screen.
+ *
+ * The baseline BRACKETS the switch when there is one, and neither copy is
+ * redundant: before, so `?1049h`'s saveCursor() banks grounded state rather
+ * than the gap's into the register a later `?1049l` restores from, and so the
+ * SOURCE buffer's margins are grounded too (`\x1b[r` is per buffer and the
+ * switch does not carry it across); after, so `?1049l`'s restoreCursor() cannot
+ * reapply that register over the grounding. With no switch there is one buffer
+ * and one copy.
+ *
+ * The clear differs by target: a normal-buffer payload carries its own history
+ * so `\x1b[3J` may wipe scrollback, while an alt restore clears only the alt
+ * screen. It is explicit because `?1049h` does not clear the alt buffer — see
+ * xterm's own `1049 should clear altbuffer` FIXME.
+ */
+export function buildSnapshotReplayPrologue(args: {
+  targetAlternateScreen: boolean
+  paneOnAlternateScreen: boolean
+}): string {
+  const clear = args.targetAlternateScreen ? '\x1b[2J\x1b[H' : '\x1b[2J\x1b[3J\x1b[H'
+  const ground = `${REPLAY_BASELINE_TERMINAL_RESET}${REPLAY_BASELINE_BUFFER_RESET}`
+  if (args.paneOnAlternateScreen === args.targetAlternateScreen) {
+    return `${ground}${clear}${SAVE_GROUNDED_CURSOR}`
+  }
+  const bufferSwitch = args.targetAlternateScreen ? '\x1b[?1049h' : '\x1b[?1049l'
+  return `${ground}${bufferSwitch}${ground}${clear}${SAVE_GROUNDED_CURSOR}`
+}
 
 // Why: DECTCEM applies in emission order, so the payload's last ?25l/?25h is the cursor state the TUI left.
 export function replayPayloadEndsWithCursorHidden(payload: string): boolean {

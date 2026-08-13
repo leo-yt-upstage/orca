@@ -9,10 +9,14 @@ import {
   POST_REPLAY_MODE_RESET,
   POST_REPLAY_REATTACH_RESET,
   POST_REPLAY_REATTACH_RESET_KEEP_MOUSE,
+  ABORT_TRUNCATED_CONTROL_STRING,
+  buildSnapshotReplayPrologue,
   RESET_AFTER_BYTE_GAP,
   RESET_KITTY_KEYBOARD_PROTOCOL,
   RESET_TERMINAL_CURSOR_STYLE
 } from '../../../../shared/terminal-mode-reset-profiles'
+
+const NORMAL_BUFFER_PROLOGUE = `${ABORT_TRUNCATED_CONTROL_STRING}${buildSnapshotReplayPrologue({ targetAlternateScreen: false, paneOnAlternateScreen: false })}`
 import { buildFreshShellViewportBlankingSequence } from './terminal-restored-viewport'
 import { DEFAULT_DA1_RESPONSE } from './terminal-capability-replies'
 import { TERMINAL_PASTE_DIRECT_MAX_BYTES } from './terminal-paste-coordinator'
@@ -10565,7 +10569,7 @@ describe('connectPanePty', () => {
       claim: true
     })
     expect(written).toContain(viewportClear)
-    expect(written).not.toContain(`${RESET_AFTER_BYTE_GAP}\x1b[2J\x1b[3J\x1b[H`)
+    expect(written).not.toContain(NORMAL_BUFFER_PROLOGUE)
     expect(written).toEqual(
       expect.arrayContaining([coldScrollback, POST_REPLAY_MODE_RESET, blankViewport])
     )
@@ -15610,6 +15614,10 @@ describe('connectPanePty', () => {
       4
     )
     expect(actual).toEqual(expected)
+    // The imageless snapshot skips the repaint, but the gap still happened — so
+    // the pen is grounded anyway, with the live-path constant since nothing
+    // repaints over whatever is still running here.
+    expect(restoreWrites).toContain(RESET_AFTER_BYTE_GAP)
     expect(transport.serializeBufferOutcome).toHaveBeenCalledTimes(1)
     expect(transport.serializeBuffer).not.toHaveBeenCalled()
     disposable.dispose()
@@ -15840,10 +15848,7 @@ describe('connectPanePty', () => {
 
     expect(getMainBufferSnapshot).toHaveBeenCalledWith('pty-id', { scrollbackRows: 5000 })
     expect(pane.terminal.resize).toHaveBeenCalledWith(100, 30)
-    expect(pane.terminal.write).toHaveBeenCalledWith(
-      `${RESET_AFTER_BYTE_GAP}\x1b[2J\x1b[3J\x1b[H`,
-      expect.any(Function)
-    )
+    expect(pane.terminal.write).toHaveBeenCalledWith(NORMAL_BUFFER_PROLOGUE, expect.any(Function))
     expect(pane.terminal.write).toHaveBeenCalledWith('snapshot-state\r\n', expect.any(Function))
     expect(pane.terminal.write).not.toHaveBeenCalledWith(live, expect.any(Function))
     disposable.dispose()
@@ -15893,27 +15898,28 @@ describe('connectPanePty', () => {
     await flushAsyncTicks(20)
 
     expect(getMainBufferSnapshot).toHaveBeenCalledWith('pty-id', { scrollbackRows: 5000 })
-    expect(pane.terminal.write).toHaveBeenCalledWith(
-      `${RESET_AFTER_BYTE_GAP}\x1b[?1049l\x1b[2J\x1b[3J\x1b[H`,
-      expect.any(Function)
-    )
+    expect(pane.terminal.write).toHaveBeenCalledWith(NORMAL_BUFFER_PROLOGUE, expect.any(Function))
     expect(pane.terminal.write).toHaveBeenCalledWith(
       'preserved-shell-history\r\n',
       expect.any(Function)
     )
     expect(pane.terminal.write).toHaveBeenCalledWith(
-      `${RESET_AFTER_BYTE_GAP}\x1b[?1049h\x1b[2J\x1b[H`,
+      buildSnapshotReplayPrologue({ targetAlternateScreen: true, paneOnAlternateScreen: false }),
       expect.any(Function)
     )
     const writes = (pane.terminal.write as ReturnType<typeof vi.fn>).mock.calls.map(
       (call) => call[0]
     )
     expect(writes.indexOf('preserved-shell-history\r\n')).toBeLessThan(
-      writes.indexOf(`${RESET_AFTER_BYTE_GAP}\x1b[?1049h\x1b[2J\x1b[H`)
+      writes.indexOf(
+        buildSnapshotReplayPrologue({ targetAlternateScreen: true, paneOnAlternateScreen: false })
+      )
     )
-    expect(writes.indexOf(`${RESET_AFTER_BYTE_GAP}\x1b[?1049h\x1b[2J\x1b[H`)).toBeLessThan(
-      writes.indexOf('altscreen-snapshot\r\n')
-    )
+    expect(
+      writes.indexOf(
+        buildSnapshotReplayPrologue({ targetAlternateScreen: true, paneOnAlternateScreen: false })
+      )
+    ).toBeLessThan(writes.indexOf('altscreen-snapshot\r\n'))
     expect(pane.terminal.write).toHaveBeenCalledWith('altscreen-snapshot\r\n', expect.any(Function))
     disposable.dispose()
   })
@@ -16176,6 +16182,9 @@ describe('connectPanePty', () => {
     const combinedLiveIndex = written.indexOf(firstLive + secondLive)
     expect(warningIndex).toBeGreaterThanOrEqual(0)
     expect(written[warningIndex - 1]).toBe(RESET_AFTER_BYTE_GAP)
+    // Exactly one: writeRestoreUnavailableWarning already grounds the gap, so a
+    // second unconditional write here was pure duplication.
+    expect(written.filter((data) => data === RESET_AFTER_BYTE_GAP)).toHaveLength(1)
     expect(combinedLiveIndex).toBeGreaterThan(warningIndex)
 
     snapshot.resolve({
@@ -16289,6 +16298,9 @@ describe('connectPanePty', () => {
     const liveIndex = written.indexOf(live)
     expect(resetIndex).toBeGreaterThanOrEqual(0)
     expect(liveIndex).toBeGreaterThan(resetIndex)
+    // The re-arm arm grounds in rearmRemoteHiddenOutputRestoreInsteadOfWarning,
+    // so the abandon body must not ground a second time.
+    expect(written.filter((data) => data === RESET_AFTER_BYTE_GAP)).toHaveLength(1)
     expect(written.join('')).not.toContain('main recovery was unavailable')
 
     disposable.dispose()
@@ -16344,6 +16356,10 @@ describe('connectPanePty', () => {
     expect(getMainBufferSnapshot).toHaveBeenCalledTimes(4)
     expect(warningIndex).toBeGreaterThanOrEqual(0)
     expect(liveIndex).toBeGreaterThan(warningIndex)
+    // This arm gives up on recovery too, so the gap is grounded exactly once
+    // before the blocked foreground is drained under it.
+    expect(written.filter((data) => data === RESET_AFTER_BYTE_GAP)).toHaveLength(1)
+    expect(written.indexOf(RESET_AFTER_BYTE_GAP)).toBeLessThan(liveIndex)
     disposable.dispose()
   })
 
@@ -16810,7 +16826,7 @@ describe('connectPanePty', () => {
     expect(pane.terminal.clear).toHaveBeenCalled()
     expect(pane.terminal.write).not.toHaveBeenCalledWith(live, expect.any(Function))
     expect(pane.terminal.write).not.toHaveBeenCalledWith(
-      `${RESET_AFTER_BYTE_GAP}\x1b[2J\x1b[3J\x1b[H`,
+      NORMAL_BUFFER_PROLOGUE,
       expect.any(Function)
     )
     disposable.dispose()
@@ -17708,7 +17724,7 @@ describe('connectPanePty', () => {
     await flushAsyncTicks(6)
 
     expect(pane.terminal.write).not.toHaveBeenCalledWith(
-      `${RESET_AFTER_BYTE_GAP}\x1b[2J\x1b[3J\x1b[H`,
+      NORMAL_BUFFER_PROLOGUE,
       expect.any(Function)
     )
     expect(pane.terminal.write).toHaveBeenCalledWith(
